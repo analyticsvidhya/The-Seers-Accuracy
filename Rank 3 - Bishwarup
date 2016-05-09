@@ -1,0 +1,611 @@
+#################
+# CV: 0.8765884 #
+# LB: 0.8784xxx #
+#################
+
+# load libraries
+require(readr)
+require(dplyr)
+require(lubridate)
+require(data.table)
+require(Matrix)
+require(caret)
+require(tm)
+options(dplyr.print_max = Inf)
+options(dplyr.width = Inf)
+require(xgboost)
+require(Metrics)
+
+# set working directory
+dir <- 'F:/AV/seers/'
+setwd(dir)
+set.seed(1121)
+
+#####################################
+#####################################
+### PLEASE FORMAT THE DATE COLUMNS ##
+### IN THE DATA FILE IN MS EXCEL ####
+### BEFORE RUNNING THIS SCRIPT ######
+#####################################
+#####################################
+
+# load raw data
+seers <- read_csv('./RawData/Train_seers_accuracy.csv')
+
+# format date columns and derive age
+seers$Transaction_Date <- as.Date(seers$Transaction_Date, format = '%m/%d/%Y')
+seers$DOB <- as.Date(seers$DOB, format = '%m/%d/%Y')
+seers$Transaction_Amount <- log1p(seers$Transaction_Amount)
+seers$customerAge <- as.integer(difftime(as.Date('2007-01-01'), seers$DOB, units = 'days')/365)
+seers$customerAge[seers$customerAge < 0] <- -1
+
+# mean transaction amount for each product category
+seers <- seers %>% group_by(Product_Category) %>% mutate(meanPriceByCategory = mean(Transaction_Amount))
+
+######################################
+# get the levels of factor variables #
+######################################
+storeID_lav <- unique(seers$Store_ID)
+PurchasedInSale_lav <- unique(seers$Purchased_in_Sale)
+Gender_lav <- unique(seers$Gender)
+refFriend_lav <- unique(seers$Referred_Friend)
+salesExecutiveID_lav <- unique(seers$Sales_Executive_ID)
+salesExecutiveCat_lav <- unique(seers$Sales_Executive_Category)
+leadSrc_lav <- unique(seers$Lead_Source_Category)
+payMode_lav <- unique(seers$Payment_Mode)
+prodCat_lav <- unique(seers$Product_Category)
+
+##############################
+## train window 2003 - 2005 ##
+##############################
+train <- seers[seers$Transaction_Date < as.Date('2006-01-01'),]
+labelWindow <- seers[seers$Transaction_Date >= as.Date('2006-01-01'),][, c('Transaction_ID', 'Client_ID')] #to derive the labels of train
+labelWindow <- labelWindow[!duplicated(labelWindow$Client_ID),]
+labelWindow$isRepeat <- 1 # the target variable
+labelWindow$Transaction_ID <- NULL # remove transaction_ID
+
+# we decast selected features 
+# by each Client_ID
+tr <- data.table(train)
+tr <- tr[,strp := 1]
+dc_store <- as.data.frame(dcast(tr, Client_ID ~ Store_ID, value.var = 'strp'))
+dc_prodCat <- as.data.frame(dcast(tr, Client_ID ~ Product_Category, value.var = 'strp'))
+dc_salesExecCat <- as.data.frame(dcast(tr, Client_ID ~ Sales_Executive_Category, value.var = 'strp'))
+dc_payMode <- as.data.frame(dcast(tr, Client_ID ~ Payment_Mode, value.var = 'strp'))
+dc_leadSrc <- as.data.frame(dcast(tr, Client_ID ~ Lead_Source_Category, value.var = 'strp'))
+
+# finally merge the decast dataframe with train frame
+train <- merge(train, dc_store, by = 'Client_ID', all.x= TRUE)
+train <- merge(train, dc_prodCat, by = 'Client_ID', all.x= TRUE)
+train <- merge(train, dc_salesExecCat, by = 'Client_ID', all.x= TRUE)
+train <- merge(train, dc_payMode, by = 'Client_ID', all.x= TRUE)
+train <- merge(train, dc_leadSrc, by = 'Client_ID', all.x= TRUE)
+
+# get the mean popularity of all the
+# sales executive attending a particular client
+train <- train %>% group_by(Sales_Executive_ID) %>% mutate(salesExecutiveCnt = n())
+train <- train %>% group_by(Client_ID) %>% mutate(salesExecutiveMeanPopularity = mean(salesExecutiveCnt))
+
+# price range offered to customer compared
+# to the mean price range in that category
+train <- train %>% group_by(Client_ID, Product_Category) %>% mutate(meanPriceByCategoryByClient = mean(Transaction_Amount))
+train$entropyPriceRatio <- -log(train$meanPriceByCategoryByClient/train$meanPriceByCategory)
+train <- train %>% group_by(Client_ID) %>% mutate(entrPriceTotal = sum(entropyPriceRatio))
+
+# get the last purchase history of the client
+# in last 1 year, 6 months and last month and 3 months
+last_6mon <- train[train$Transaction_Date >= as.Date('2005-07-01'),] %>% group_by(Client_ID) %>% summarize(last6monthPurchase = n())
+lasy_1year <- train[train$Transaction_Date >= as.Date('2005-01-01'),] %>% group_by(Client_ID) %>% summarize(last1yearPurchase = n())
+last_1mon <- train[train$Transaction_Date >= as.Date('2005-12-01'),] %>% group_by(Client_ID) %>% summarize(last1monthPurchase = n())
+last_3mon <- train[train$Transaction_Date >= as.Date('2005-10-01'),] %>% group_by(Client_ID) %>% summarize(last3monthPurchase = n())
+train <- merge(train, last_6mon, by = 'Client_ID', all.x = TRUE)
+train <- merge(train, lasy_1year, by = 'Client_ID', all.x = TRUE)
+train <- merge(train, last_1mon, by = 'Client_ID', all.x = TRUE)
+train <- merge(train, last_3mon, by = 'Client_ID', all.x = TRUE)
+train$last6monthPurchase[is.na(train$last6monthPurchase)] <- 0
+train$last1yearPurchase[is.na(train$last1yearPurchase)] <- 0
+train$last1monthPurchase[is.na(train$last1monthPurchase)] <- 0
+train$last3monthPurchase[is.na(train$last3monthPurchase)] <- 0
+
+# sort the train frame by transaction date and client_ID
+train <- train[order(train$Transaction_Date, train$Client_ID),]
+
+# factorize categorical variables with pre-chosen lavels
+train$Store_ID <- as.integer(factor(train$Store_ID, levels = storeID_lav))
+train$Purchased_in_Sale <- as.integer(factor(train$Purchased_in_Sale, levels = PurchasedInSale_lav))
+train$Referred_Friend <- as.integer(factor(train$Referred_Friend, levels = refFriend_lav))
+train$Gender <- as.integer(factor(train$Gender, levels = Gender_lav))
+train$Sales_Executive_ID <- as.integer(factor(train$Sales_Executive_ID, levels = salesExecutiveID_lav))
+train$Sales_Executive_Category <- as.integer(factor(train$Sales_Executive_Category, levels = salesExecutiveCat_lav))
+train$Lead_Source_Category <- as.integer(factor(train$Lead_Source_Category, levels = leadSrc_lav))
+train$Payment_Mode <- as.integer(factor(train$Payment_Mode, levels = payMode_lav))
+train$Product_Category <- as.integer(factor(train$Product_Category, levels = prodCat_lav))
+
+# derive client specific features
+tr <- data.table(train)
+tr[, `:=` (numPrevPurchase = .N,
+           FirstProductCat = Product_Category[1],
+           ProductCatCount = length(unique(Product_Category)),
+           FirstExecCat = Sales_Executive_Category[1],
+           ExecutiveCatCount = length(unique(Sales_Executive_Category)),
+           FirstStoreVisited = Store_ID[1],
+           numStoreVisited = length(unique(Store_ID)),
+           LastStoreVisited = Store_ID[length(Store_ID)],
+           FirstSalesExecutive = Sales_Executive_ID[1],
+           lastPurchaseDate = max(Transaction_Date),
+           FirstPurchaseDate = min(Transaction_Date),
+           uniqueVar1s = length(unique(Var1)),
+           uniqueVar2s = length(unique(Var2)),
+           uniqueVar3s = length(unique(Var3)),
+           uniquePayModes = length(unique(Payment_Mode)),
+           uniqueStores = length(unique(Store_ID)),
+           meanTransAmt= mean(Transaction_Amount),
+           sumTransAmt = sum(Transaction_Amount),
+           maxTransAmt = max(Transaction_Amount),
+           minTransAmt = min(Transaction_Amount),
+           rangeTransAmt = max(Transaction_Amount) - min(Transaction_Amount),
+           meanEMI = mean(Number_of_EMI),
+           maxEMI = max(Number_of_EMI),
+           unqSalesExec = length(unique(Sales_Executive_ID)),
+           totalPurchasedInSale = sum(Purchased_in_Sale),
+           lastSalesExecutive = Sales_Executive_ID[length(Sales_Executive_ID)])
+   , by = Client_ID]
+
+train <- as.data.frame(tr)
+
+# create some more features
+train$toLastPurchase <- as.integer(difftime(as.Date('2006-01-01'), train$lastPurchaseDate, units = 'days')/30)
+train$FirstLastPurchaseGap <- as.integer(difftime(train$lastPurchaseDate, train$FirstPurchaseDate, units = 'days')/30)
+train$inSalePurchaseRatio <- train$totalPurchasedInSale/ train$numPrevPurchase
+train$StorePenetration <- train$numStoreVisited/ train$numPrevPurchase
+train$ProductPenetration <- train$ProductCatCount/ train$numPrevPurchase
+train$SalesExecutiveCategoryPenetration <- train$ExecutiveCatCount/ train$numPrevPurchase
+
+# delete duplicated records of clients
+train <- train[!duplicated(train$Client_ID),]
+train <- merge(train, labelWindow, by = 'Client_ID', all.x = TRUE) # merge the target variable
+train$isRepeat[is.na(train$isRepeat)] <- 0
+rm(tr); gc()
+
+##############################
+## test window 2003 - 2006 ###
+##############################
+test <- seers
+# we decast selected features 
+# by each Client_ID
+te <- data.table(test)
+te <- te[,strp := 1]
+dc_store <- as.data.frame(dcast(te, Client_ID ~ Store_ID, value.var = 'strp'))
+dc_prodCat <- as.data.frame(dcast(te, Client_ID ~ Product_Category, value.var = 'strp'))
+dc_salesExecCat <- as.data.frame(dcast(te, Client_ID ~ Sales_Executive_Category, value.var = 'strp'))
+dc_payMode <- as.data.frame(dcast(te, Client_ID ~ Payment_Mode, value.var = 'strp'))
+dc_leadSrc <- as.data.frame(dcast(te, Client_ID ~ Lead_Source_Category, value.var = 'strp'))
+# finally merge the decast dataframe with train frame
+test <- merge(test, dc_store, by = 'Client_ID', all.x= TRUE)
+test <- merge(test, dc_prodCat, by = 'Client_ID', all.x= TRUE)
+test <- merge(test, dc_salesExecCat, by = 'Client_ID', all.x= TRUE)
+test <- merge(test, dc_payMode, by = 'Client_ID', all.x= TRUE)
+test <- merge(test, dc_leadSrc, by = 'Client_ID', all.x= TRUE)
+
+# get the mean popularity of all the
+# sales executive attending a particular client
+test <- test %>% group_by(Sales_Executive_ID) %>% mutate(salesExecutiveCnt = n())
+test <- test %>% group_by(Client_ID) %>% mutate(salesExecutiveMeanPopularity = mean(salesExecutiveCnt))
+
+test <- test %>% group_by(Client_ID, Product_Category) %>% mutate(meanPriceByCategoryByClient = mean(Transaction_Amount))
+test$entropyPriceRatio <- -log(test$meanPriceByCategoryByClient/test$meanPriceByCategory)
+test <- test %>% group_by(Client_ID) %>% mutate(entrPriceTotal = sum(entropyPriceRatio))
+# get the last purchase history of the client
+# in last 1 year, 6 months and last month and 3 months
+last_6mon <- test[test$Transaction_Date >= as.Date('2006-07-01'),] %>% group_by(Client_ID) %>% summarize(last6monthPurchase = n())
+lasy_1year <- test[test$Transaction_Date >= as.Date('2006-01-01'),] %>% group_by(Client_ID) %>% summarize(last1yearPurchase = n())
+last_1mon <- test[test$Transaction_Date >= as.Date('2006-12-01'),] %>% group_by(Client_ID) %>% summarize(last1monthPurchase = n())
+last_3mon <- test[test$Transaction_Date >= as.Date('2006-10-01'),] %>% group_by(Client_ID) %>% summarize(last3monthPurchase = n())
+test <- merge(test, last_6mon, by = 'Client_ID', all.x = TRUE)
+test <- merge(test, lasy_1year, by = 'Client_ID', all.x = TRUE)
+test <- merge(test, last_1mon, by = 'Client_ID', all.x = TRUE)
+test <- merge(test, last_3mon, by = 'Client_ID', all.x = TRUE)
+test$last6monthPurchase[is.na(test$last6monthPurchase)] <- 0
+test$last1yearPurchase[is.na(test$last1yearPurchase)] <- 0
+test$last1monthPurchase[is.na(test$last1monthPurchase)] <- 0
+test$last3monthPurchase[is.na(test$last3monthPurchase)] <- 0
+
+# sort the test frame by transaction date and client_ID
+test <- test[order(test$Transaction_Date, test$Client_ID),]
+
+# factorize categorical features
+test$Store_ID <- as.integer(factor(test$Store_ID, levels = storeID_lav))
+test$Purchased_in_Sale <- as.integer(factor(test$Purchased_in_Sale, levels = PurchasedInSale_lav))
+test$Referred_Friend <- as.integer(factor(test$Referred_Friend, levels = refFriend_lav))
+test$Gender <- as.integer(factor(test$Gender, levels = Gender_lav))
+test$Sales_Executive_ID <- as.integer(factor(test$Sales_Executive_ID, levels = salesExecutiveID_lav))
+test$Sales_Executive_Category <- as.integer(factor(test$Sales_Executive_Category, levels = salesExecutiveCat_lav))
+test$Lead_Source_Category <- as.integer(factor(test$Lead_Source_Category, levels = leadSrc_lav))
+test$Payment_Mode <- as.integer(factor(test$Payment_Mode, levels = payMode_lav))
+test$Product_Category <- as.integer(factor(test$Product_Category, levels = prodCat_lav))
+
+# derive client specific features
+te <- data.table(test)
+te[, `:=` (numPrevPurchase = .N,
+           FirstProductCat = Product_Category[1],
+           ProductCatCount = length(unique(Product_Category)),
+           FirstExecCat = Sales_Executive_Category[1],
+           ExecutiveCatCount = length(unique(Sales_Executive_Category)),
+           FirstStoreVisited = Store_ID[1],
+           numStoreVisited = length(unique(Store_ID)),
+           LastStoreVisited = Store_ID[length(Store_ID)],
+           FirstSalesExecutive = Sales_Executive_ID[1],
+           lastPurchaseDate = max(Transaction_Date),
+           FirstPurchaseDate = min(Transaction_Date),
+           uniqueVar1s = length(unique(Var1)),
+           uniqueVar2s = length(unique(Var2)),
+           uniqueVar3s = length(unique(Var3)),
+           uniquePayModes = length(unique(Payment_Mode)),
+           uniqueStores = length(unique(Store_ID)),
+           meanTransAmt= mean(Transaction_Amount),
+           sumTransAmt = sum(Transaction_Amount),
+           maxTransAmt = max(Transaction_Amount),
+           minTransAmt = min(Transaction_Amount),
+           rangeTransAmt = max(Transaction_Amount) - min(Transaction_Amount),
+           meanEMI = mean(Number_of_EMI),
+           maxEMI = max(Number_of_EMI),
+           unqSalesExec = length(unique(Sales_Executive_ID)),
+           totalPurchasedInSale = sum(Purchased_in_Sale),
+           lastSalesExecutive = Sales_Executive_ID[length(Sales_Executive_ID)])
+   , by = Client_ID]
+test <- as.data.frame(te)
+
+# derive some temporal features
+test$toLastPurchase <- as.integer(difftime(as.Date('2007-01-01'), test$lastPurchaseDate, units = 'days')/30)
+test$FirstLastPurchaseGap <- as.integer(difftime(test$lastPurchaseDate, test$FirstPurchaseDate, units = 'days')/30)
+test$inSalePurchaseRatio <- test$totalPurchasedInSale/ test$numPrevPurchase
+test$StorePenetration <- test$numStoreVisited/ test$numPrevPurchase
+test$ProductPenetration <- test$ProductCatCount/ test$numPrevPurchase
+test$SalesExecutiveCategoryPenetration <- test$ExecutiveCatCount/ test$numPrevPurchase
+# remove duplicated client records
+test <- test[!duplicated(test$Client_ID),]
+
+# drop irrelevant features fro
+# train and test frame
+toDrop <- c('Transaction_ID', 
+            'Transaction_Date', 
+            'Store_ID', 
+            'Number_of_EMI', 
+            'Purchased_in_Sale',
+            'Var1',
+            'Var2',
+            'Var3',
+            'DOB',
+            'Sales_Executive_ID',
+            'Sales_Executive_Category',
+            'Payment_Mode',
+            'Product_Category',
+            'Transaction_Amount',
+            'FirstPurchaseDate',
+            'lastPurchaseDate',
+            'strp',
+            'salesExecutiveCnt',
+            'meanPriceByCategory',
+            'meanPriceByCategoryByClient',
+            'entropyPriceRatio')
+
+train <- train[, !names(train) %in% toDrop]
+test <- test[, !names(test) %in% toDrop]
+setdiff(names(test), names(train))
+test <- test[, !names(test) %in% 'STO1469'] #not in train
+
+##########################
+##### train xgboost ######
+##########################
+feature.names <- names(train)[!names(train) %in% c("Client_ID", "isRepeat", "trainFlag")]
+
+dtrain <- xgb.DMatrix(data = data.matrix(train[, feature.names]), label = train$isRepeat, missing = NA)
+watchlist <- list(train = dtrain)
+clf <- xgb.train(params = param,
+                 data = dtrain,
+                 nround = 2130,
+                 print.every.n = 50,
+                 watchlist = watchlist)
+
+preds <- predict(clf, xgb.DMatrix(data.matrix(test[, feature.names]), missing = NA))
+sub<- data.frame(Client_ID = test$Client_ID, Cross_Sell= preds)
+write_csv(sub, './XGB_SUB_1.csv')
+
+#######################################
+##Now work for second XGBoost Model####
+#######################################
+
+
+#################
+# cv: 0.8763908 #
+#################
+
+
+#####################################
+#####################################
+### PLEASE FORMAT THE DATE COLUMNS ##
+### IN THE DATA FILE IN MS EXCEL ####
+### BEFORE RUNNING THIS SCRIPT ######
+#####################################
+#####################################
+
+# load raw data
+seers <- read_csv('./RawData/Train_seers_accuracy.csv')
+
+# format date columns and derive age
+seers$Transaction_Date <- as.Date(seers$Transaction_Date, format = '%m/%d/%Y')
+seers$DOB <- as.Date(seers$DOB, format = '%m/%d/%Y')
+seers$Transaction_Amount <- log1p(seers$Transaction_Amount)
+seers$customerAge <- as.integer(difftime(as.Date('2007-01-01'), seers$DOB, units = 'days')/365)
+seers$customerAge[seers$customerAge < 0] <- -1
+
+######################################
+# get the levels of factor variables #
+######################################
+storeID_lav <- unique(seers$Store_ID)
+PurchasedInSale_lav <- unique(seers$Purchased_in_Sale)
+Gender_lav <- unique(seers$Gender)
+refFriend_lav <- unique(seers$Referred_Friend)
+salesExecutiveID_lav <- unique(seers$Sales_Executive_ID)
+salesExecutiveCat_lav <- unique(seers$Sales_Executive_Category)
+leadSrc_lav <- unique(seers$Lead_Source_Category)
+payMode_lav <- unique(seers$Payment_Mode)
+prodCat_lav <- unique(seers$Product_Category)
+
+##############################
+## train window 2003 - 2005 ##
+##############################
+train <- seers[seers$Transaction_Date < as.Date('2006-01-01'),]
+labelWindow <- seers[seers$Transaction_Date >= as.Date('2006-01-01'),][, c('Transaction_ID', 'Client_ID')] #to derive the labels of train
+labelWindow <- labelWindow[!duplicated(labelWindow$Client_ID),]
+labelWindow$isRepeat <- 1 # the target variable
+labelWindow$Transaction_ID <- NULL # remove transaction_ID
+
+# we decast selected features 
+# by each Client_ID
+tr <- data.table(train)
+tr <- tr[,strp := 1]
+dc_store <- as.data.frame(dcast(tr, Client_ID ~ Store_ID, value.var = 'strp'))
+dc_prodCat <- as.data.frame(dcast(tr, Client_ID ~ Product_Category, value.var = 'strp'))
+dc_salesExecCat <- as.data.frame(dcast(tr, Client_ID ~ Sales_Executive_Category, value.var = 'strp'))
+dc_payMode <- as.data.frame(dcast(tr, Client_ID ~ Payment_Mode, value.var = 'strp'))
+dc_leadSrc <- as.data.frame(dcast(tr, Client_ID ~ Lead_Source_Category, value.var = 'strp'))
+
+# finally merge the decast dataframe with train frame
+train <- merge(train, dc_store, by = 'Client_ID', all.x= TRUE)
+train <- merge(train, dc_prodCat, by = 'Client_ID', all.x= TRUE)
+train <- merge(train, dc_salesExecCat, by = 'Client_ID', all.x= TRUE)
+train <- merge(train, dc_payMode, by = 'Client_ID', all.x= TRUE)
+train <- merge(train, dc_leadSrc, by = 'Client_ID', all.x= TRUE)
+
+# get the mean popularity of all the
+# sales executive attending a particular client
+train <- train %>% group_by(Sales_Executive_ID) %>% mutate(salesExecutiveCnt = n())
+train <- train %>% group_by(Client_ID) %>% mutate(salesExecutiveMeanPopularity = mean(salesExecutiveCnt))
+
+# get the last purchase history of the client
+# in last 1 year, 6 months and last month and 3 months
+last_6mon <- train[train$Transaction_Date > as.Date('2005-07-30'),] %>% group_by(Client_ID) %>% summarize(last6monthPurchase = n())
+lasy_1year <- train[train$Transaction_Date >= as.Date('2005-01-01'),] %>% group_by(Client_ID) %>% summarize(last1yearPurchase = n())
+last_1mon <- train[train$Transaction_Date >= as.Date('2005-12-01'),] %>% group_by(Client_ID) %>% summarize(last1monthPurchase = n())
+last_3mon <- train[train$Transaction_Date >= as.Date('2005-10-01'),] %>% group_by(Client_ID) %>% summarize(last3monthPurchase = n())
+train <- merge(train, last_6mon, by = 'Client_ID', all.x = TRUE)
+train <- merge(train, lasy_1year, by = 'Client_ID', all.x = TRUE)
+train <- merge(train, last_1mon, by = 'Client_ID', all.x = TRUE)
+train <- merge(train, last_3mon, by = 'Client_ID', all.x = TRUE)
+train$last6monthPurchase[is.na(train$last6monthPurchase)] <- 0
+train$last1yearPurchase[is.na(train$last1yearPurchase)] <- 0
+train$last1monthPurchase[is.na(train$last1monthPurchase)] <- 0
+train$last3monthPurchase[is.na(train$last3monthPurchase)] <- 0
+
+# sort the train frame by transaction date and client_ID
+train <- train[order(train$Transaction_Date, train$Client_ID),]
+
+train$Store_ID <- as.integer(factor(train$Store_ID, levels = storeID_lav))
+train$Purchased_in_Sale <- as.integer(factor(train$Purchased_in_Sale, levels = PurchasedInSale_lav))
+train$Referred_Friend <- as.integer(factor(train$Referred_Friend, levels = refFriend_lav))
+train$Gender <- as.integer(factor(train$Gender, levels = Gender_lav))
+train$Sales_Executive_ID <- as.integer(factor(train$Sales_Executive_ID, levels = salesExecutiveID_lav))
+train$Sales_Executive_Category <- as.integer(factor(train$Sales_Executive_Category, levels = salesExecutiveCat_lav))
+train$Lead_Source_Category <- as.integer(factor(train$Lead_Source_Category, levels = leadSrc_lav))
+train$Payment_Mode <- as.integer(factor(train$Payment_Mode, levels = payMode_lav))
+train$Product_Category <- as.integer(factor(train$Product_Category, levels = prodCat_lav))
+
+# derive client specific features
+tr <- data.table(train)
+tr[, `:=` (numPrevPurchase = .N,
+           FirstProductCat = Product_Category[1],
+           ProductCatCount = length(unique(Product_Category)),
+           FirstExecCat = Sales_Executive_Category[1],
+           ExecutiveCatCount = length(unique(Sales_Executive_Category)),
+           FirstStoreVisited = Store_ID[1],
+           FirstSalesExecutive = Sales_Executive_ID[1],
+           lastPurchaseDate = max(Transaction_Date),
+           FirstPurchaseDate = min(Transaction_Date),
+           uniqueVar1s = length(unique(Var1)),
+           uniqueVar2s = length(unique(Var2)),
+           uniqueVar3s = length(unique(Var3)),
+           uniquePayModes = length(unique(Payment_Mode)),
+           uniqueStores = length(unique(Store_ID)),
+           meanTransAmt= mean(Transaction_Amount),
+           maxTransAmt = max(Transaction_Amount),
+           minTransAmt = min(Transaction_Amount),
+           rangeTransAmt = max(Transaction_Amount) - min(Transaction_Amount),
+           meanEMI = mean(Number_of_EMI),
+           maxEMI = max(Number_of_EMI),
+           unqSalesExec = length(unique(Sales_Executive_ID)),
+           totalPurchasedInSale = sum(Purchased_in_Sale),
+           lastSalesExecutive = Sales_Executive_ID[length(Sales_Executive_ID)])
+   , by = Client_ID]
+
+train <- as.data.frame(tr)
+
+train$toLastPurchase <- as.integer(difftime(as.Date('2006-01-01'), train$lastPurchaseDate, units = 'days')/30)
+train$FirstLastPurchaseGap <- as.integer(difftime(train$lastPurchaseDate, train$FirstPurchaseDate, units = 'days')/30)
+train$inSalePurchaseRatio <- train$totalPurchasedInSale/ train$numPrevPurchase
+
+# delete duplicated records of clients
+train <- train[!duplicated(train$Client_ID),]
+train <- merge(train, labelWindow, by = 'Client_ID', all.x = TRUE) # merge the target variable
+train$isRepeat[is.na(train$isRepeat)] <- 0
+rm(tr); gc()
+
+##############################
+## test window 2003 - 2006 ###
+##############################
+test <- seers
+# we decast selected features 
+# by each Client_ID
+te <- data.table(test)
+te <- te[,strp := 1]
+dc_store <- as.data.frame(dcast(te, Client_ID ~ Store_ID, value.var = 'strp'))
+dc_prodCat <- as.data.frame(dcast(te, Client_ID ~ Product_Category, value.var = 'strp'))
+dc_salesExecCat <- as.data.frame(dcast(te, Client_ID ~ Sales_Executive_Category, value.var = 'strp'))
+dc_payMode <- as.data.frame(dcast(te, Client_ID ~ Payment_Mode, value.var = 'strp'))
+dc_leadSrc <- as.data.frame(dcast(te, Client_ID ~ Lead_Source_Category, value.var = 'strp'))
+# finally merge the decast dataframe with train frame
+test <- merge(test, dc_store, by = 'Client_ID', all.x= TRUE)
+test <- merge(test, dc_prodCat, by = 'Client_ID', all.x= TRUE)
+test <- merge(test, dc_salesExecCat, by = 'Client_ID', all.x= TRUE)
+test <- merge(test, dc_payMode, by = 'Client_ID', all.x= TRUE)
+test <- merge(test, dc_leadSrc, by = 'Client_ID', all.x= TRUE)
+
+# get the mean popularity of all the
+# sales executive attending a particular client
+test <- test %>% group_by(Sales_Executive_ID) %>% mutate(salesExecutiveCnt = n())
+test <- test %>% group_by(Client_ID) %>% mutate(salesExecutiveMeanPopularity = mean(salesExecutiveCnt))
+
+# get the last purchase history of the client
+# in last 1 year, 6 months and last month and 3 months
+last_6mon <- test[test$Transaction_Date > as.Date('2006-07-30'),] %>% group_by(Client_ID) %>% summarize(last6monthPurchase = n())
+lasy_1year <- test[test$Transaction_Date >= as.Date('2006-01-01'),] %>% group_by(Client_ID) %>% summarize(last1yearPurchase = n())
+last_1mon <- test[test$Transaction_Date >= as.Date('2006-12-01'),] %>% group_by(Client_ID) %>% summarize(last1monthPurchase = n())
+last_3mon <- test[test$Transaction_Date >= as.Date('2006-10-01'),] %>% group_by(Client_ID) %>% summarize(last3monthPurchase = n())
+test <- merge(test, last_6mon, by = 'Client_ID', all.x = TRUE)
+test <- merge(test, lasy_1year, by = 'Client_ID', all.x = TRUE)
+test <- merge(test, last_1mon, by = 'Client_ID', all.x = TRUE)
+test <- merge(test, last_3mon, by = 'Client_ID', all.x = TRUE)
+test$last6monthPurchase[is.na(test$last6monthPurchase)] <- 0
+test$last1yearPurchase[is.na(test$last1yearPurchase)] <- 0
+test$last1monthPurchase[is.na(test$last1monthPurchase)] <- 0
+test$last3monthPurchase[is.na(test$last3monthPurchase)] <- 0
+
+# sort the test frame by transaction date and client_ID
+test <- test[order(test$Transaction_Date, test$Client_ID),]
+
+# factorize categorical features
+test$Store_ID <- as.integer(factor(test$Store_ID, levels = storeID_lav))
+test$Purchased_in_Sale <- as.integer(factor(test$Purchased_in_Sale, levels = PurchasedInSale_lav))
+test$Referred_Friend <- as.integer(factor(test$Referred_Friend, levels = refFriend_lav))
+test$Gender <- as.integer(factor(test$Gender, levels = Gender_lav))
+test$Sales_Executive_ID <- as.integer(factor(test$Sales_Executive_ID, levels = salesExecutiveID_lav))
+test$Sales_Executive_Category <- as.integer(factor(test$Sales_Executive_Category, levels = salesExecutiveCat_lav))
+test$Lead_Source_Category <- as.integer(factor(test$Lead_Source_Category, levels = leadSrc_lav))
+test$Payment_Mode <- as.integer(factor(test$Payment_Mode, levels = payMode_lav))
+test$Product_Category <- as.integer(factor(test$Product_Category, levels = prodCat_lav))
+
+# derive client specific features
+te <- data.table(test)
+te[, `:=` (numPrevPurchase = .N,
+           FirstProductCat = Product_Category[1],
+           ProductCatCount = length(unique(Product_Category)),
+           FirstExecCat = Sales_Executive_Category[1],
+           ExecutiveCatCount = length(unique(Sales_Executive_Category)),
+           FirstStoreVisited = Store_ID[1],
+           FirstSalesExecutive = Sales_Executive_ID[1],
+           lastPurchaseDate = max(Transaction_Date),
+           FirstPurchaseDate = min(Transaction_Date),
+           uniqueVar1s = length(unique(Var1)),
+           uniqueVar2s = length(unique(Var2)),
+           uniqueVar3s = length(unique(Var3)),
+           uniquePayModes = length(unique(Payment_Mode)),
+           uniqueStores = length(unique(Store_ID)),
+           meanTransAmt= mean(Transaction_Amount),
+           maxTransAmt = max(Transaction_Amount),
+           minTransAmt = min(Transaction_Amount),
+           rangeTransAmt = max(Transaction_Amount) - min(Transaction_Amount),
+           meanEMI = mean(Number_of_EMI),
+           maxEMI = max(Number_of_EMI),
+           unqSalesExec = length(unique(Sales_Executive_ID)),
+           totalPurchasedInSale = sum(Purchased_in_Sale),
+           lastSalesExecutive = Sales_Executive_ID[length(Sales_Executive_ID)])
+   , by = Client_ID]
+test <- as.data.frame(te)
+
+# derive some temporal features
+test$toLastPurchase <- as.integer(difftime(as.Date('2007-01-01'), test$lastPurchaseDate, units = 'days')/30)
+test$FirstLastPurchaseGap <- as.integer(difftime(test$lastPurchaseDate, test$FirstPurchaseDate, units = 'days')/30)
+test$inSalePurchaseRatio <- test$totalPurchasedInSale/ test$numPrevPurchase
+# remove duplicated client records
+test <- test[!duplicated(test$Client_ID),]
+
+# drop irrelevant features fro
+# train and test frame
+toDrop <- c('Transaction_ID', 
+            'Transaction_Date', 
+            'Store_ID', 
+            'Number_of_EMI', 
+            'Purchased_in_Sale',
+            'Var1',
+            'Var2',
+            'Var3',
+            'DOB',
+            'Sales_Executive_ID',
+            'Sales_Executive_Category',
+            'Payment_Mode',
+            'Product_Category',
+            'Transaction_Amount',
+            'FirstPurchaseDate',
+            'lastPurchaseDate',
+            'strp',
+            'salesExecutiveCnt')
+
+train <- train[, !names(train) %in% toDrop]
+test <- test[, !names(test) %in% toDrop]
+setdiff(names(test), names(train))
+test <- test[, !names(test) %in% 'STO1469'] #not in train
+
+# save the data files to disk
+write_csv(train, 'XGB2_TRAIN.csv')
+write_csv(test, 'XGB2_TEST.csv')
+
+##############################
+###Ensemble - Rank Averaging##
+##############################
+
+##################
+## RANK AVERAGE ##
+##################
+
+# load libraries
+require(readr)
+
+# set working directory
+dir <- 'F:/AV/seers/Subs/'
+setwd(dir)
+set.seed(1121)
+
+#MimMax scalar
+minMaxScale <- function(x) {
+  scaled <- (x - min(x))/(max(x) - min(x))
+  return(scaled)
+}
+
+xgb1 <- read_csv('./XGB_SUB_1.csv')
+xgb2 <- read_csv('./XGB_SUB_2.csv')
+
+names(xgb1)[2] <- 'xgb1'
+names(xgb2)[2] <- 'xgb2'
+
+m <- merge(xgb1, xgb2)
+m$r_xgb1 <- rank(m$xgb1)
+m$r_xgb2 <- rank(m$xgb2)
+m$r_avg <- 0.7*m$r_xgb2 + 0.3*m$r_xgb1
+m$Cross_Sell <- minMaxScale(m$r_avg)
+sub <- m[, c('Client_ID', 'Cross_Sell')]
+write_csv(sub, 'FINAL_SUBMISSION.csv') 
+
+
+
+
+
