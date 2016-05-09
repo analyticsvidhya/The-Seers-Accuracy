@@ -569,6 +569,68 @@ test <- test[, !names(test) %in% 'STO1469'] #not in train
 write_csv(train, 'XGB2_TRAIN.csv')
 write_csv(test, 'XGB2_TEST.csv')
 
+##################################################
+###Used Python to train an another Xgboost model##
+##################################################
+
+
+from __future__ import division
+from datetime import datetime
+import os
+import numpy as np
+import pandas as pd
+from sklearn.cross_validation import StratifiedKFold
+from xgboost import XGBClassifier
+
+parent_dir = 'F:/AV/seers/'
+np.random.seed(21210)
+
+if __name__ == '__main__':
+    
+    train = pd.read_csv(os.path.join(parent_dir, 'XGB2_TRAIN.csv'))
+    test = pd.read_csv(os.path.join(parent_dir, 'XGB2_TEST.csv'))
+    
+    train['FirstStoreVisited'] = train['FirstStoreVisited'].astype(str)
+    train['FirstSalesExecutive'] = train['FirstSalesExecutive'].astype(str)
+    test['FirstStoreVisited'] = test['FirstStoreVisited'].astype(str)
+    test['FirstSalesExecutive'] = test['FirstSalesExecutive'].astype(str)
+    
+    cat_cols = ['FirstStoreVisited', 'FirstSalesExecutive']
+    y = np.array(train['isRepeat'])
+    tr_cat, te_cat = get_ctr_features(train, test, y, cat_cols, 0.0045, 0.5)
+    tr_cat, te_cat = pd.DataFrame(tr_cat), pd.DataFrame(te_cat)
+    tr_cat.columns = cat_cols
+    te_cat.columns = cat_cols
+    
+    train.drop(cat_cols, axis = 1, inplace = True)
+    test.drop(cat_cols, axis = 1, inplace = True)
+    
+    train = pd.concat([train, tr_cat], axis = 1)
+    test = pd.concat([test, te_cat], axis = 1)
+    feature_names = [f for f in train.columns if f not in['Client_ID', 'isRepeat']]
+
+    gbm = XGBClassifier(max_depth=4,
+                        learning_rate = 0.012,
+                        n_estimators=1050,
+                        subsample=0.9,
+                        colsample_bytree=0.45,
+                        objective="binary:logistic",
+                        silent = False,
+                        min_child_weight=1,                       
+                        nthread=-1)
+                        
+    gbm.fit(train[feature_names], train['isRepeat'],
+            eval_metric='auc',
+            eval_set= [(train[feature_names], train['isRepeat'])],
+                       verbose=50)
+        
+    preds = gbm.predict_proba(test[feature_names])[:, 1]
+    sub = pd.DataFrame({'Client_ID': test['Client_ID'], 'Cross_Sell' : preds})
+    sub.to_csv(os.path.join(parent_dir, 'XGB_SUB_2.csv'), index = False)
+
+
+
+
 ##############################
 ###Ensemble - Rank Averaging##
 ##############################
